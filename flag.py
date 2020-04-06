@@ -1,126 +1,156 @@
 from functools import reduce
-from typing import Any
+from types import FunctionType
+from typing import Any, Dict, Tuple, Union
 
 
 class RepeatedFlagValueError(Exception):
     pass
 
 
-def auto(cls):
-    if not isinstance(cls, FlaggedEnumMeta):
-        raise TypeError
-    existing = reduce(lambda acc, fl: acc | fl.value, cls.declared_flags, 0)
-    mask = 1
-    while mask & existing:
-        mask <<= 1
-    return mask
+class IllegalFlagValueError(Exception):
+    pass
+
+
+class AutoGen:
+    """
+    Generates legal flag values for enums
+    """
+
+    def __init__(self, *reserved_values: Tuple[int, ...]) -> None:
+        """
+        Creates new flag value generator
+        :param reserved_values: values to be skipped during flags generation
+        """
+        self._reserved_values = reduce(lambda acc, val: acc | val, reserved_values, 0)
+        super().__init__()
+
+    def __next__(self) -> int:
+        """
+        Retrieves next legal flag value
+        :return: next legal flag value
+        """
+        next_val = ~self._reserved_values - (~self._reserved_values & (~self._reserved_values - 1))
+        self._reserved_values |= next_val
+        return next_val
+
+
+auto = AutoGen
 
 
 class FlaggedEnumMeta(type):
-    def __new__(mcs, name, bases, attrs, **kwargs) -> Any:
+    """
+    Meta class for all flagged enums. Allows declaring class attributes
+    as unique flags, also allows automatic flag values generation via
+    AutoGen flag value suppliers
+    Provides ability to test flags types, iterate by declared flags and
+    get flags by their names/values
+    """
+
+    def __new__(mcs: type, name: str, bases: Tuple[type, ...], attrs: Dict[str, Any], auto_gen_cls=auto) -> Any:
         return super().__new__(mcs, name, bases, attrs)
 
-    def __init__(cls, name, bases, attrs) -> None:
-        cls.__declared_flags = []
-        cls.__all_flags = []
-        for name, value in attrs.items():
-            if cls.__is_flag_definition(name, value):
-                new_flag = cls.__make_flag_value(name, value)
-                cls.__declared_flags += [new_flag]
-                setattr(cls, name, new_flag)
+    def __init__(cls, name: str, bases: Tuple[type, ...], attrs: Dict[str, Any], auto_gen_cls=auto) -> None:
+        cls.name = property(lambda self: self._name)
+        cls.value = property(lambda self: self._value)
+
+        cls._all_flags = set()
+        declared_flags = {cls(name=attr_name, value=attr_value)
+                          for attr_name, attr_value
+                          in attrs.items()
+                          if cls._is_flag_def(attr_name, attr_value)
+                          and attr_value is not auto_gen_cls}
+
+        auto_gen = auto_gen_cls(*(flag.value for flag in declared_flags))
+        for attr_name, attr_value in attrs.items():
+            if attr_value is auto_gen_cls:
+                declared_flags.add(cls(name=attr_name, value=next(auto_gen)))
+
+        cls._declared_flags = frozenset(declared_flags)
+        cls._assert_unique_flags()
+        for flag in cls._declared_flags:
+            setattr(cls, flag.name, flag)
+
         super().__init__(name, bases, attrs)
 
-    @property
-    def declared_flags(self):
-        return self.__declared_flags
-
-    @property
-    def all_flags(self):
-        return self.__all_flags
-
-    def __call__(cls, *args: Any, name, value, **kwargs: Any) -> Any:
-        flag = cls.__new__(cls, *args, *kwargs)
-        FlaggedEnum.__init__(flag, name=name, value=value)
-        cls.__all_flags += [flag]
+    def __call__(cls, *args: Any, name: str, value: Any, **kwargs: Any) -> Any:
+        if not isinstance(value, int):
+            raise IllegalFlagValueError(f'{value} is not legal flag value')
+        flag = super().__call__(*args, **kwargs)
+        flag._name = name
+        flag._value = value
+        cls._all_flags.add(flag)
         return flag
 
     @staticmethod
-    def __is_flag_definition(name, value):
-        return (value is auto or not hasattr(value, '__call__')) \
-                and not isinstance(value, property) \
-                and not name.startswith('_')
+    def _is_flag_def(name: str, value: Any) -> bool:
+        return not isinstance(value, (FunctionType, property, classmethod, staticmethod)) \
+               and not name.startswith('_')
 
-    def __make_flag_value(cls, name: str, value) -> Any:
-        if value is auto:
-            value = auto(cls)
-        if not isinstance(value, int):
-            raise TypeError
-        if any(value & flag.value for flag in cls.__declared_flags):
-            raise RepeatedFlagValueError(name)
-
-        return cls(name=name, value=value)
+    def _assert_unique_flags(cls):
+        composition = 0
+        for flag in cls._declared_flags:
+            if composition & flag.value:
+                raise RepeatedFlagValueError(flag.name)
+            composition |= flag.value
 
     def __iter__(cls):
-        yield from cls.__declared_flags
+        yield from cls._declared_flags
 
-    def __getitem__(cls, item):
-        if isinstance(item, str):
-            flag = (fl for fl in cls.__declared_flags if fl.name == item)
-        elif isinstance(item, int):
-                flag = (fl for fl in cls.__declared_flags if fl.value == item)
-        else:
-            raise TypeError
+    def get_by_name(cls, name: str):
         try:
-            return next(flag)
-        except StopIteration:
-            raise IndexError
+            return getattr(cls, name)
+        except AttributeError:
+            raise IndexError(f'No declared flag with name {name}')
+
+    def get_by_value(cls, value: int):
+        for flag in cls._declared_flags:
+            if flag.value == value:
+                return flag
+        else:
+            raise IndexError(f'No declared flag with value ({value})')
+
+    def __getitem__(cls, item: Union[int, str]):
+        if isinstance(item, str):
+            return cls.get_by_name(item)
+        elif isinstance(item, int):
+            return cls.get_by_value(item)
 
     def __contains__(cls, item):
-        if isinstance(item, cls):
-            return item in (fl for fl in cls.__all_flags)
-        return False
+        return isinstance(item, cls) and item in cls._all_flags
 
 
 class FlaggedEnum(int, metaclass=FlaggedEnumMeta):
-
-    def __new__(cls) -> Any:
-        return super().__new__(cls)
-
-    def __init__(self, name=None, value=None) -> None:
-        self.__name = name
-        self.__value = value
-        super().__init__()
-
-    @property
-    def name(self):
-        return self.__name
-
-    @property
-    def value(self):
-        return self.__value
+    """
+    Base class for flagged enums. Supplies flag check and combination methods
+    """
 
     def __and__(self, other):
-        if type(other) is not type(self):
+        if not isinstance(other, self.__class__):
             raise TypeError
         return self.value & other.value
 
     def __or__(self, other):
-        if type(other) is not type(self):
+        cls = self.__class__
+        if not isinstance(other, cls):
             raise TypeError
 
         compound_value = self.value | other.value
-        try:
-            return FlaggedEnum[compound_value]
-        except IndexError:
-            compound_name = '{}|{}'.format(self.name, other.name)
-            return type(self)(name=compound_name, value=compound_value)
+        for flag in cls._all_flags:
+            if flag.value == compound_value:
+                return flag
+        else:
+            compound_name = f'{self.name}|{other.name}'
+            return cls(name=compound_name, value=compound_value)
+
+    def __hash__(self):
+        return self.value
 
     def __eq__(self, other):
-        return self.value == other.value
+        return self is other
 
     def __str__(self):
-        cls = type(self)
-        if self in cls.declared_flags:
-            return '{}.{}({})'.format(cls.__name__, self.name, self.value)
+        cls = self.__class__
+        if self in cls:
+            return f'{cls.__name__}.{self.name}({self.value})'
         else:
-            return ' | '.join(str(fl) for fl in cls.declared_flags if self & fl)
+            return ' | '.join(str(flag) for flag in cls if self & flag)
